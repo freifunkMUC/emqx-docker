@@ -1,0 +1,270 @@
+name: docker
+
+# Pull requests and pushes: build and smoke test; pushes to main publish the
+# image if its inputs changed. A daily run rebuilds without cache and
+# publishes only if the published image has pending Debian package upgrades
+# or the pinned base image changed since it was built (as openldap-docker).
+# Otherwise the digest of the published tags stays as it is.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and publish even if nothing changed
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Not at minute 0: GitHub delays or drops scheduled runs at the start of
+    # the hour.
+    - cron: "17 4 * * *"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      push: ${{ steps.decide.outputs.push }}
+      no_cache: ${{ steps.decide.outputs.no_cache }}
+      base_name: ${{ steps.decide.outputs.base_name }}
+      base_digest: ${{ steps.decide.outputs.base_digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          FORCE: ${{ inputs.force }}
+          BEFORE: ${{ github.event.before }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          IMAGE="${IMAGE,,}"  # registry names are lowercase
+          # The base image the Dockerfile builds from, and its digest.
+          base_ref=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' Dockerfile | head -n1)
+          base_digest=${base_ref##*@}
+          base_name=${base_ref%@*}
+          case "$base_digest" in sha256:*) ;; *) echo "FROM is not pinned by digest: $base_ref" >&2; exit 1 ;; esac
+          build=true push=false no_cache=false
+
+          case "$EVENT" in
+            pull_request)
+              ;;
+            push)
+              if [ "$REF_NAME" = main ]; then
+                inputs=(Dockerfile test/smoke.sh .github/workflows/docker.yml)
+                if [ -z "${BEFORE//0/}" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+                   || ! git diff --quiet "$BEFORE" "$GITHUB_SHA" -- "${inputs[@]}"; then
+                  push=true
+                else
+                  echo "Inputs of the image unchanged: test only, no publish"
+                fi
+              fi
+              ;;
+            workflow_dispatch | schedule)
+              no_cache=true
+              if [ "$FORCE" = true ]; then
+                echo "Forced"
+                push=true
+              else
+                # Published image: pending upgrades inside it, and the base
+                # image it was built from.
+                if ! out=$(docker pull --quiet --platform linux/amd64 "$IMAGE:latest" 2>&1); then
+                  if grep -qiE 'not found|manifest unknown' <<< "$out"; then
+                    echo "Nothing published yet"
+                    push=true
+                  else
+                    echo "Cannot pull $IMAGE:latest: $out" >&2
+                    exit 1
+                  fi
+                else
+                  # A failing "apt-get update" or "docker run" must not look like "nothing pending".
+                  upgrade=$(docker run --rm --platform linux/amd64 --user 0 --entrypoint bash "$IMAGE:latest" \
+                    -c 'apt-get -qq --error-on=any update >/dev/null && apt-get -s upgrade') || exit 1
+                  pending=$(grep -c '^Inst ' <<< "$upgrade" || true)
+                  built_from=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' "$IMAGE:latest")
+                  echo "Pending upgrades: $pending"
+                  echo "Base digest: published ${built_from:-none}, Dockerfile $base_digest"
+                  if [ "$pending" -gt 0 ] || [ "$built_from" != "$base_digest" ]; then
+                    push=true
+                  else
+                    echo "up to date"
+                  fi
+                fi
+              fi
+              [ "$push" = true ] || build=false
+              ;;
+          esac
+
+          {
+            echo "build=$build"
+            echo "push=$push"
+            echo "no_cache=$no_cache"
+            echo "base_name=$base_name"
+            echo "base_digest=$base_digest"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      emqx: ${{ steps.version.outputs.emqx }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Built once for the runner and tested before anything is pushed. A
+      # scheduled or manual build ignores the cache: a cached "apt-get
+      # install" layer would carry old packages. Its layers go into the cache
+      # for the publish job.
+      # Loaded into the local daemon, which cannot hold attestations: no
+      # provenance here, the published build has it.
+      - name: Build for the test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: emqx:test
+          no-cache: ${{ needs.decide.outputs.no_cache == 'true' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Smoke test
+        run: test/smoke.sh emqx:test
+
+      # Tags follow the EMQX version of the base image, e.g. 5.8.9.
+      - name: Version of EMQX
+        id: version
+        run: |
+          v=$(docker run --rm --entrypoint cat emqx:test /opt/emqx/releases/emqx_vars | sed -n 's/^REL_VSN="\(.*\)"/\1/p')
+          [ -n "$v" ] || { echo "no EMQX version found" >&2; exit 1; }
+          echo "emqx=$v" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [decide, build]
+    if: needs.decide.outputs.push == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    # Two runs probing the same -rN would overwrite each other's tag.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The first unused <version>-rN, found by asking the registry. Only a
+      # "not found" answer means the tag is free; any other error fails the
+      # job rather than risk overwriting an immutable tag.
+      - name: Rebuild number
+        id: rebuild
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          EMQX: ${{ needs.build.outputs.emqx }}
+        run: |
+          IMAGE="${IMAGE,,}"  # registry names are lowercase
+          n=1
+          while true; do
+            if out=$(docker buildx imagetools inspect "$IMAGE:$EMQX-r$n" 2>&1); then
+              n=$((n + 1))
+            elif grep -qiE 'not found|manifest unknown' <<< "$out"; then
+              break
+            else
+              echo "Cannot probe $IMAGE:$EMQX-r$n: $out" >&2
+              exit 1
+            fi
+          done
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # <version>, latest and <version>-<date> move with every rebuild
+          # (the last one to the last build of that day); <version>-rN and
+          # sha-<commit> stay.
+          tags: |
+            type=raw,value=${{ needs.build.outputs.emqx }}
+            type=raw,value=${{ needs.build.outputs.emqx }}-r${{ steps.rebuild.outputs.n }}
+            type=raw,value=${{ needs.build.outputs.emqx }}-${{ steps.rebuild.outputs.date }}
+            type=raw,value=latest
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=EMQX
+            org.opencontainers.image.description=EMQX ${{ needs.build.outputs.emqx }} (Apache-2.0) with current Debian security updates
+            org.opencontainers.image.version=${{ needs.build.outputs.emqx }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.base.name=${{ needs.decide.outputs.base_name }}
+            org.opencontainers.image.base.digest=${{ needs.decide.outputs.base_digest }}
+
+      # The layers of the tested build come from the builder's cache; only
+      # the second architecture is built here.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Image name
+        id: image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: echo "name=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

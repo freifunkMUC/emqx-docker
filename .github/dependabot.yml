@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # The digest of the EMQX base image. 5.9 and later are BSL: stay on 5.8.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "emqx/emqx"
+        versions: [">=5.9"]
+  - package-ecosystem: "github-actions"
+    directory: /
+    schedule:
+      interval: "monthly"
