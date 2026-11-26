@@ -17,3 +17,7 @@
 A daily job checks the published image and rebuilds it without cache only if `apt-get upgrade` would change packages or the pinned base image changed (label `org.opencontainers.image.base.digest`); otherwise the digest stays. Builds are smoke-tested ([`test/smoke.sh`](test/smoke.sh)) before they are pushed, with build provenance and SBOM.
 
 Pin a digest if you want to decide yourself when an update arrives.
+
+## License
+
+The files in this repository are under the [Apache License 2.0](LICENSE), as EMQX 5.8.9 itself.
